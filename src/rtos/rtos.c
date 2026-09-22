@@ -25,6 +25,7 @@ static const struct rtos_type *rtos_types[] = {
 	&embkernel_rtos,
 	&freertos_rtos,
 	&linux_rtos,
+	&liteos_ws63_rtos,
 	&mqx_rtos,
 	&nuttx_rtos,
 	&riot_rtos,
@@ -516,7 +517,13 @@ static int rtos_put_gdb_reg(struct connection *connection,
 		return ERROR_FAIL;
 	}
 
-	size_t len = hexify(hex, reg_value, reg_bytes, num_bytes);
+	size_t len = reg_bytes * 2;
+	if (reg_value) {
+		hexify(hex, reg_value, reg_bytes, num_bytes);
+	} else {
+		memset(hex, 'x', len);
+		hex[len] = 0;
+	}
 
 	gdb_put_packet(connection, hex, len);
 	free(hex);
@@ -532,11 +539,21 @@ static int rtos_put_gdb_reg_list(struct connection *connection,
 		num_bytes += DIV_ROUND_UP(reg_list[i].size, 8) * 2;
 
 	char *hex = malloc(num_bytes);
+	if (!hex)
+		return ERROR_FAIL;
 	char *hex_p = hex;
 
 	for (int i = 0; i < num_regs; ++i) {
 		size_t count = DIV_ROUND_UP(reg_list[i].size, 8);
-		size_t n = hexify(hex_p, reg_list[i].value, count, num_bytes);
+		size_t n;
+		if (get_target_from_connection(connection)->rtos->type->supports_unavailable_registers &&
+				reg_list[i].unavailable) {
+			n = count * 2;
+			memset(hex_p, 'x', n);
+			hex_p[n] = 0;
+		} else {
+			n = hexify(hex_p, reg_list[i].value, count, num_bytes);
+		}
 		hex_p += n;
 		num_bytes -= n;
 	}
@@ -784,4 +801,12 @@ struct target *rtos_swbp_target(struct target *target, target_addr_t address,
 	if (target->rtos->type->swbp_target)
 		return target->rtos->type->swbp_target(target->rtos, address, length, type);
 	return target;
+}
+
+/* A saved task context is an observation view, not a switched CPU context. */
+bool rtos_register_view_read_only(struct target *target)
+{
+	struct rtos *r = target->rtos;
+	return r && r->type->thread_registers_read_only && r->current_threadid > 0 &&
+		r->current_threadid != r->current_thread;
 }

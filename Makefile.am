@@ -62,6 +62,8 @@ endif
 EXTRA_DIST += \
 	BUGS \
 	HACKING \
+	doc/ws63.md \
+	doc/ws63-setup.md \
 	NEWTAPS \
 	README.Windows.md \
 	README.macOS.md \

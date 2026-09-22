@@ -11,6 +11,7 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/opcodes.h \
        %D%/program.h \
        %D%/riscv.h \
+       %D%/ws63_insn.h \
        %D%/riscv_reg_impl.h \
        %D%/riscv_reg.h \
        %D%/riscv-011.h \

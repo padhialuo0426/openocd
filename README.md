@@ -1,5 +1,8 @@
 # Welcome to OpenOCD
 
+本仓库的 `ws63` 分支维护 BearPi-Pico H3863 / WS63 适配。
+[功能与未实现项](doc/ws63.md) · [构建与连接](doc/ws63-setup.md)
+
 OpenOCD provides on-chip programming and debugging support with a
 layered architecture of JTAG interface and TAP support including:
 

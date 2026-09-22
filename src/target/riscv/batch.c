@@ -275,6 +275,52 @@ static void log_batch(const struct riscv_batch *batch, size_t start_idx,
 	}
 }
 
+/* Keep the batch API's one-scan delayed result convention while issuing
+ * real ordered AP accesses. A DAP failure is returned, never reported as a
+ * successful DMI operation. Buffers remain alive until dap_run completes. */
+static int riscv_batch_run_ap(struct riscv_batch *batch, size_t start)
+{
+	struct adiv5_ap *ap = riscv_info(batch->target)->dmi_ap;
+	uint32_t *values = calloc(batch->used_scans, sizeof(*values));
+	if (!values)
+		return ERROR_FAIL;
+	int result = ERROR_OK;
+	for (size_t i = start; i < batch->used_scans; ++i) {
+		const uint8_t *out = batch->fields[i].out_value;
+		unsigned int op = buf_get_u32(out, DTM_DMI_OP_OFFSET, DTM_DMI_OP_LENGTH);
+		uint32_t address = buf_get_u32(out, DTM_DMI_ADDRESS_OFFSET,
+				riscv_get_dmi_address_bits(batch->target));
+		if (op == DTM_DMI_OP_READ)
+			result = mem_ap_read_u32(ap, (target_addr_t)address << 2, &values[i]);
+		else if (op == DTM_DMI_OP_WRITE)
+			result = mem_ap_write_u32(ap, (target_addr_t)address << 2,
+					buf_get_u32(out, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH));
+		else if (op != DTM_DMI_OP_NOP)
+			result = ERROR_FAIL;
+		if (result != ERROR_OK)
+			break;
+	}
+	/* Drain even a partially queued batch before freeing its read buffers. */
+	int run_result = dap_run(ap->dap);
+	if (result == ERROR_OK)
+		result = run_result;
+	if (result == ERROR_OK) {
+		for (size_t i = start; i < batch->used_scans; ++i) {
+			uint8_t *in = batch->fields[i].in_value;
+			if (!in)
+				continue;
+			memset(in, 0, DIV_ROUND_UP(batch->fields[i].num_bits, 8));
+			if (i > start)
+				buf_set_u32(in, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH, values[i - 1]);
+		}
+		batch->was_run = true;
+		batch->last_scan_delay = 0;
+	}
+	free(values);
+	keep_alive();
+	return result;
+}
+
 int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 		const struct riscv_scan_delays *delays, bool resets_delays,
 		size_t reset_delays_after)
@@ -284,6 +330,9 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 	assert(batch->last_scan == RISCV_SCAN_TYPE_NOP);
 	assert(!batch->was_run || riscv_batch_was_scan_busy(batch, start_idx));
 	assert(start_idx == 0 || !riscv_batch_was_scan_busy(batch, start_idx - 1));
+
+	if (riscv_info(batch->target)->dmi_ap)
+		return riscv_batch_run_ap(batch, start_idx);
 
 	if (batch->was_run)
 		add_idle_before_batch(batch, start_idx, delays);
