@@ -11,6 +11,7 @@ struct riscv_program;
 #include "jtag/jtag.h"
 #include "target/semihosting_common.h"
 #include "target/target.h"
+#include "target/arm_adi_v5.h"
 #include "target/register.h"
 #include <helper/command.h>
 #include <helper/bits.h>
@@ -167,6 +168,14 @@ riscv_mem_access_is_write(const struct riscv_mem_access_args args)
 
 struct riscv_info {
 	unsigned int common_magic;
+	/* Optional memory-mapped DMI transport through a CoreSight AP. */
+	struct adiv5_ap *dmi_ap;
+	struct adiv5_ap *ws63_ap1;
+	bool ws63_rearm;
+	bool ws63_flash_failed;
+	bool ws63_flash_changed;
+	bool ws63_flash_enabled;
+	bool ws63_flash_breakpoints;
 
 	unsigned int dtm_version;
 
@@ -377,6 +386,8 @@ enum riscv_priv_mode {
 };
 
 struct riscv_private_config {
+	struct adiv5_private_config dap_config;
+	bool ws63;
 	bool dcsr_ebreak_fields[N_RISCV_MODE];
 	bool dcsr_cetrig;
 };
@@ -435,6 +446,10 @@ extern struct scan_field select_dtmcontrol;
 extern struct scan_field select_dbus;
 extern struct scan_field select_idcode;
 
+int riscv_ws63_sync(struct target *target);
+int riscv_ws63_rearm(struct target *target);
+int ws63_flash_patch(struct target *target, target_addr_t address, const uint8_t *data, uint32_t count);
+int riscv_dtmcs_scan(struct target *target, uint32_t out, uint32_t *in_ptr);
 int dtmcs_scan(struct jtag_tap *tap, uint32_t out, uint32_t *in_ptr);
 
 extern struct scan_field *bscan_tunneled_select_dmi;

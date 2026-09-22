@@ -21,6 +21,8 @@
 #include "helper/base64.h"
 #include "helper/time_support.h"
 #include "riscv.h"
+#include "ws63_insn.h"
+#include "rtos/rtos.h"
 #include "riscv_reg.h"
 #include "program.h"
 #include "gdb_regs.h"
@@ -484,6 +486,8 @@ static struct riscv_private_config *alloc_default_riscv_private_config(void)
 		return NULL;
 	}
 
+	config->dap_config.ap_num = DP_APSEL_INVALID;
+
 	for (unsigned int i = 0; i < ARRAY_SIZE(config->dcsr_ebreak_fields); ++i)
 		config->dcsr_ebreak_fields[i] = true;
 
@@ -621,12 +625,14 @@ static int jim_report_ebreak_config(const struct riscv_private_config *config,
 enum riscv_cfg_opts {
 	RISCV_CFG_EBREAK,
 	RISCV_CFG_CETRIG,
+	RISCV_CFG_WS63,
 	RISCV_CFG_INVALID = -1
 };
 
 static struct jim_nvp nvp_config_opts[] = {
 	{ .name = "-ebreak", .value = RISCV_CFG_EBREAK },
 	{ .name = "-cetrig", .value = RISCV_CFG_CETRIG },
+	{ .name = "-ws63", .value = RISCV_CFG_WS63 },
 	{ .name = NULL, .value = RISCV_CFG_INVALID }
 };
 
@@ -647,7 +653,8 @@ static int riscv_jim_configure(struct target *target,
 	int e = jim_nvp_name2value_obj(goi->interp, nvp_config_opts,
 				goi->argv[0], &n);
 	if (e != JIM_OK)
-		return JIM_CONTINUE;
+		return adiv5_jim_configure_ext(target, goi, &config->dap_config,
+				ADI_CONFIGURE_DAP_OPTIONAL);
 
 	e = jim_getopt_obj(goi, NULL);
 	if (e != JIM_OK)
@@ -664,6 +671,7 @@ static int riscv_jim_configure(struct target *target,
 			? jim_configure_ebreak(config, goi)
 			: jim_report_ebreak_config(config, goi->interp);
 	case RISCV_CFG_CETRIG:
+	case RISCV_CFG_WS63:
 		if (goi->is_configure) {
 			struct jim_nvp *opt_nvp;
 			e = jim_getopt_nvp(goi, nvp_on_off_opts, &opt_nvp);
@@ -671,10 +679,14 @@ static int riscv_jim_configure(struct target *target,
 				jim_getopt_nvp_unknown(goi, nvp_on_off_opts, /*hadprefix*/ true);
 				return e;
 			}
-			config->dcsr_cetrig = opt_nvp->value;
+			if (n->value == RISCV_CFG_WS63)
+				config->ws63 = opt_nvp->value;
+			else
+				config->dcsr_cetrig = opt_nvp->value;
 		} else {
 			Jim_SetResultString(goi->interp,
-				jim_nvp_value2name_simple(nvp_on_off_opts, config->dcsr_cetrig)->name, -1);
+				jim_nvp_value2name_simple(nvp_on_off_opts,
+					n->value == RISCV_CFG_WS63 ? config->ws63 : config->dcsr_cetrig)->name, -1);
 		}
 		break;
 	default:
@@ -691,25 +703,26 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 	info->cmd_ctx = cmd_ctx;
 	info->reset_delays_wait = -1;
 
-	select_dtmcontrol.num_bits = target->tap->ir_length;
-	select_dbus.num_bits = target->tap->ir_length;
-	select_idcode.num_bits = target->tap->ir_length;
+	if (!riscv_private_config(target)->dap_config.dap) {
+		select_dtmcontrol.num_bits = target->tap->ir_length;
+		select_dbus.num_bits = target->tap->ir_length;
+		select_idcode.num_bits = target->tap->ir_length;
 
-	if (bscan_tunnel_ir_width != 0) {
-		uint32_t ir_user4_raw = bscan_tunnel_ir_id;
-		/* Provide a default value which target some Xilinx FPGA USER4 IR */
-		if (ir_user4_raw == 0) {
-			assert(target->tap->ir_length >= 6);
-			ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
+		if (bscan_tunnel_ir_width != 0) {
+			uint32_t ir_user4_raw = bscan_tunnel_ir_id;
+			/* Provide a default value which target some Xilinx FPGA USER4 IR */
+			if (ir_user4_raw == 0) {
+				assert(target->tap->ir_length >= 6);
+				ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
+			}
+			h_u32_to_le(ir_user4, ir_user4_raw);
+			select_user4.num_bits = target->tap->ir_length;
+			if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
+				bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
+			else /* BSCAN_TUNNEL_NESTED_TAP */
+				bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
 		}
-		h_u32_to_le(ir_user4, ir_user4_raw);
-		select_user4.num_bits = target->tap->ir_length;
-		if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
-			bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
-		else /* BSCAN_TUNNEL_NESTED_TAP */
-			bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
 	}
-
 	riscv_semihosting_init(target);
 
 	target->debug_reason = DBG_REASON_DBGRQ;
@@ -740,8 +753,6 @@ static void riscv_deinit_target(struct target *target)
 {
 	LOG_TARGET_DEBUG(target, "riscv_deinit_target()");
 
-	free(target->private_config);
-
 	struct riscv_info *info = target->arch_info;
 	struct target_type *tt = get_target_type(target);
 	if (!tt)
@@ -752,6 +763,12 @@ static void riscv_deinit_target(struct target *target)
 
 	if (tt && info && info->version_specific)
 		tt->deinit_target(target);
+
+	if (info && info->dmi_ap)
+		dap_put_ap(info->dmi_ap);
+	if (info && info->ws63_ap1)
+		dap_put_ap(info->ws63_ap1);
+	free(target->private_config);
 
 	riscv_reg_free_all(target);
 	free_wp_triggers_cache(target);
@@ -1627,10 +1644,31 @@ int riscv_read_by_any_size(struct target *target, target_addr_t address, uint32_
 	return ERROR_FAIL;
 }
 
+int riscv_ws63_sync(struct target *target)
+{
+	int ret = riscv_reg_write(target, GDB_REGNO_CSR0 + 0x7c3, 12);
+	if (ret == ERROR_OK)
+		ret = riscv_reg_write(target, GDB_REGNO_CSR0 + 0x7c2, 4);
+	return ret;
+}
+
+static int riscv_breakpoint_write(struct target *target, target_addr_t address,
+		uint32_t size, uint8_t *data)
+{
+	if (riscv_private_config(target)->ws63 && address >= 0x200000 && address < 0x600000)
+		return ws63_flash_patch(target, address, data, size);
+	return riscv_write_by_any_size(target, address, size, data);
+}
+
 static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakpoint)
 {
 	LOG_TARGET_DEBUG(target, "@0x%" TARGET_PRIxADDR, breakpoint->address);
 	assert(breakpoint);
+	if (riscv_private_config(target)->ws63 && breakpoint->type == BKPT_SOFT &&
+			((breakpoint->address >= 0x100000 && breakpoint->address < 0x14c000) ||
+			(breakpoint->address >= 0x200000 && breakpoint->address < 0x600000 &&
+			!riscv_info(target)->ws63_flash_breakpoints)))
+		breakpoint->type = BKPT_HARD;
 	if (breakpoint->type == BKPT_SOFT) {
 		/** @todo check RVC for size/alignment */
 		if (!(breakpoint->length == 4 || breakpoint->length == 2)) {
@@ -1655,7 +1693,7 @@ static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakp
 		uint8_t buff[4] = { 0 };
 		buf_set_u32(buff, 0, breakpoint->length * CHAR_BIT, breakpoint->length == 4 ? ebreak() : ebreak_c());
 		/* Write the ebreak instruction. */
-		if (riscv_write_by_any_size(target, breakpoint->address, breakpoint->length, buff) != ERROR_OK) {
+		if (riscv_breakpoint_write(target, breakpoint->address, breakpoint->length, buff) != ERROR_OK) {
 			LOG_TARGET_ERROR(target, "Failed to write %d-byte breakpoint instruction at 0x%"
 					TARGET_PRIxADDR, breakpoint->length, breakpoint->address);
 			return ERROR_FAIL;
@@ -1717,8 +1755,8 @@ static int riscv_remove_breakpoint(struct target *target,
 {
 	if (breakpoint->type == BKPT_SOFT) {
 		/* Write the original instruction. */
-		if (riscv_write_by_any_size(
-				target, breakpoint->address, breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
+		if (riscv_breakpoint_write(target, breakpoint->address,
+				breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
 			LOG_TARGET_ERROR(target, "Failed to restore instruction for %d-byte breakpoint at "
 					"0x%" TARGET_PRIxADDR, breakpoint->length, breakpoint->address);
 			return ERROR_FAIL;
@@ -1765,7 +1803,32 @@ int riscv_add_watchpoint(struct target *target, struct watchpoint *watchpoint)
 	struct trigger trigger;
 	trigger_from_watchpoint(&trigger, watchpoint);
 
-	int result = add_trigger(target, &trigger);
+	int result;
+	if (riscv_private_config(target)->ws63) {
+		if (!watchpoint->length || watchpoint->address >= (UINT64_C(1) << 32) ||
+				watchpoint->length > (UINT64_C(1) << 32) - watchpoint->address)
+			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		uint64_t end = (watchpoint->address + watchpoint->length + 3) & ~UINT64_C(3);
+		uint64_t pos = watchpoint->address & ~UINT64_C(3);
+		result = ERROR_OK;
+		while (pos < end) {
+			uint64_t size = 4;
+			while (size * 2 <= end - pos && !(pos % (size * 2)))
+				size *= 2;
+			trigger.address = pos;
+			trigger.length = size;
+			result = add_trigger(target, &trigger);
+			if (result != ERROR_OK) {
+				if (find_first_trigger_by_id(target, watchpoint->unique_id) >= 0 &&
+						remove_trigger(target, watchpoint->unique_id) != ERROR_OK)
+					return ERROR_FAIL;
+				break;
+			}
+			pos += size;
+		}
+	} else {
+		result = add_trigger(target, &trigger);
+	}
 	if (result != ERROR_OK)
 		return result;
 
@@ -2375,11 +2438,76 @@ static int verify_loadstore(struct target *target,
  * The GDB server uses this information to tell GDB what data address has
  * been hit, which enables GDB to print the hit variable along with its old
  * and new value. */
+int riscv_ws63_rearm(struct target *target)
+{
+	RISCV_INFO(r);
+	if (!riscv_private_config(target)->ws63 || !r->ws63_rearm)
+		return ERROR_OK;
+	/* Reset erased hardware triggers; forget their old ownership first. */
+	for (unsigned int i = 0; i < r->trigger_count; ++i)
+		r->trigger_unique_id[i] = -1;
+	for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+		if (bp->type != BKPT_HARD)
+			continue;
+		bp->is_set = false;
+		int ret = riscv_add_breakpoint(target, bp);
+		if (ret != ERROR_OK)
+			return ret;
+	}
+	for (struct watchpoint *wp = target->watchpoints; wp; wp = wp->next) {
+		wp->is_set = false;
+		int ret = riscv_add_watchpoint(target, wp);
+		if (ret != ERROR_OK)
+			return ret;
+	}
+	r->ws63_rearm = false;
+	return ERROR_OK;
+}
+
+/* Return known=true only for naturally aligned scalar accesses. Unknown
+ * instructions remain stopped. Guard hits can be stepped transparently. */
+static int ws63_watch_hit(struct target *target, struct watchpoint **hit, bool *guard)
+{
+	*hit = NULL;
+	*guard = false;
+	riscv_reg_t pc, base;
+	uint8_t bytes[4];
+	if (riscv_reg_get(target, &pc, GDB_REGNO_PC) != ERROR_OK ||
+			target_read_buffer(target, pc, 4, bytes) != ERROR_OK)
+		return ERROR_FAIL;
+	struct ws63_access access;
+	if (!ws63_decode_access(le_to_h_u32(bytes), &access))
+		return ERROR_OK;
+	if (riscv_reg_get(target, &base, access.base) != ERROR_OK)
+		return ERROR_FAIL;
+	uint64_t addr = (uint32_t)(base + access.offset);
+	if (addr % access.size || addr + access.size > (UINT64_C(1) << 32))
+		return ERROR_OK;
+	for (struct watchpoint *wp = target->watchpoints; wp; wp = wp->next) {
+		if ((wp->rw == WPT_READ && !access.load) || (wp->rw == WPT_WRITE && access.load))
+			continue;
+		if (addr < wp->address + wp->length && wp->address < addr + access.size) {
+			*hit = wp;
+			return ERROR_OK;
+		}
+		uint64_t low = wp->address & ~UINT64_C(3);
+		uint64_t end = (wp->address + wp->length + 3) & ~UINT64_C(3);
+		if (addr >= low && addr < end)
+			*guard = true;
+	}
+	return ERROR_OK;
+}
+
 static int riscv_hit_watchpoint(struct target *target, struct watchpoint **hit_watchpoint)
 {
 	RISCV_INFO(r);
 
 	LOG_TARGET_DEBUG(target, "Hit Watchpoint");
+	if (riscv_private_config(target)->ws63) {
+		bool guard;
+		int ret = ws63_watch_hit(target, hit_watchpoint, &guard);
+		return ret == ERROR_OK && *hit_watchpoint ? ERROR_OK : ERROR_FAIL;
+	}
 
 	/* If we identified which trigger caused the halt earlier, then just use
 	 * that. */
@@ -2472,9 +2600,22 @@ static int oldriscv_step(struct target *target, bool current, uint32_t address,
 static int riscv_openocd_step_impl(struct target *target, bool current,
 		target_addr_t address, bool handle_breakpoints, int handle_callbacks);
 
+/* Reject before generic resume bookkeeping can mark a failed resume running. */
+static int ws63_can_run(struct target *target)
+{
+	if (riscv_private_config(target)->ws63 &&
+			(riscv_info(target)->ws63_flash_failed || riscv_info(target)->ws63_flash_changed)) {
+		LOG_TARGET_ERROR(target, "Recover failed Flash writes and reset after programming before running");
+		return ERROR_FAIL;
+	}
+	return ERROR_OK;
+}
+
 static int old_or_new_riscv_step_impl(struct target *target, bool current,
 		target_addr_t address, bool handle_breakpoints, int handle_callbacks)
 {
+	if (ws63_can_run(target) != ERROR_OK)
+		return ERROR_FAIL;
 	RISCV_INFO(r);
 	LOG_TARGET_DEBUG(target, "handle_breakpoints=%s",
 			handle_breakpoints ? "true" : "false");
@@ -2492,6 +2633,35 @@ static int old_or_new_riscv_step(struct target *target, bool current,
 		handle_breakpoints, true /* handle callbacks*/);
 }
 
+/* AP-mapped DM has no JTAG DTMCS. These describe the software transport,
+ * not a register read from the chip. DM version is still checked by examine. */
+int riscv_dtmcs_scan(struct target *target, uint32_t out, uint32_t *in_ptr)
+{
+	struct riscv_info *r = target->arch_info;
+	struct adiv5_private_config *pc = &riscv_private_config(target)->dap_config;
+	if (!pc->dap)
+		return dtmcs_scan(target->tap, out, in_ptr);
+	if (!r->dmi_ap) {
+		if (pc->ap_num == DP_APSEL_INVALID) {
+			LOG_TARGET_ERROR(target, "Memory-mapped DMI requires -ap-num");
+			return ERROR_FAIL;
+		}
+		r->dmi_ap = dap_get_ap(pc->dap, pc->ap_num);
+		if (!r->dmi_ap)
+			return ERROR_FAIL;
+		int result = mem_ap_init(r->dmi_ap);
+		if (result != ERROR_OK) {
+			dap_put_ap(r->dmi_ap);
+			r->dmi_ap = NULL;
+			return result;
+		}
+		r->dmi_ap->memaccess_tck = 8;
+	}
+	if (in_ptr)
+		*in_ptr = 1 | (7 << 4);
+	return ERROR_OK;
+}
+
 static int riscv_examine(struct target *target)
 {
 	LOG_TARGET_DEBUG(target, "Starting examination");
@@ -2504,7 +2674,7 @@ static int riscv_examine(struct target *target)
 
 	RISCV_INFO(info);
 	uint32_t dtmcontrol;
-	if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
+	if (riscv_dtmcs_scan(target, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
 		LOG_TARGET_ERROR(target, "Could not read dtmcontrol. Check JTAG connectivity/board power.");
 		return ERROR_FAIL;
 	}
@@ -2790,6 +2960,17 @@ int riscv_halt(struct target *target)
 
 static int riscv_assert_reset(struct target *target)
 {
+	if (riscv_private_config(target)->ws63) {
+		if (riscv_info(target)->ws63_flash_failed) {
+			LOG_TARGET_ERROR(target, "Recover the failed Flash operation before reset");
+			return ERROR_FAIL;
+		}
+		for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+			if (bp->type == BKPT_SOFT && bp->is_set && riscv_remove_breakpoint(target, bp) != ERROR_OK)
+				return ERROR_FAIL;
+		}
+	}
+
 	LOG_TARGET_DEBUG(target, "");
 	struct target_type *tt = get_target_type(target);
 	if (!tt)
@@ -2799,7 +2980,10 @@ static int riscv_assert_reset(struct target *target)
 		LOG_TARGET_INFO(target, "Discarding values of dirty registers.");
 
 	riscv_reg_cache_invalidate_all(target);
-	return tt->assert_reset(target);
+	int ret = tt->assert_reset(target);
+	if (ret == ERROR_OK && riscv_private_config(target)->ws63)
+		riscv_info(target)->ws63_flash_changed = false;
+	return ret;
 }
 
 static int riscv_deassert_reset(struct target *target)
@@ -2870,7 +3054,7 @@ static int resume_prep(struct target *target, bool current,
 	if (!current && riscv_reg_set(target, GDB_REGNO_PC, address) != ERROR_OK)
 		return ERROR_FAIL;
 
-	if (handle_breakpoints) {
+	if (handle_breakpoints && !(riscv_private_config(target)->ws63 && !current)) {
 		/* To be able to run off a trigger, we perform a step operation and then
 		 * resume. If handle_breakpoints is true then step temporarily disables
 		 * pending breakpoints so we can safely perform the step.
@@ -2952,6 +3136,8 @@ static int riscv_resume(struct target *target,
 		bool debug_execution,
 		bool single_hart)
 {
+	if (ws63_can_run(target) != ERROR_OK)
+		return ERROR_FAIL;
 	int result = ERROR_OK;
 
 	struct list_head *targets;
@@ -3492,9 +3678,41 @@ static int riscv_rw_memory(struct target *target, const struct riscv_mem_access_
 	return ERROR_OK;
 }
 
+static bool ws63_bus_address(target_addr_t address, uint64_t length)
+{
+	return (address >= 0x100000 && address < 0x14c000 && length <= 0x14c000 - address) ||
+		(address >= 0x200000 && address < 0x600000 && length <= 0x600000 - address) ||
+		(address >= 0x40000000 && address < 0x60000000 && length <= 0x60000000 - address);
+}
+
+static int ws63_bus_init(struct target *target)
+{
+	RISCV_INFO(r);
+	if (r->ws63_ap1)
+		return ERROR_OK;
+	struct adiv5_private_config *pc = &riscv_private_config(target)->dap_config;
+	if (!pc->dap)
+		return ERROR_FAIL;
+	r->ws63_ap1 = dap_get_ap(pc->dap, 1);
+	if (!r->ws63_ap1)
+		return ERROR_FAIL;
+	int ret = mem_ap_init(r->ws63_ap1);
+	if (ret != ERROR_OK) {
+		dap_put_ap(r->ws63_ap1);
+		r->ws63_ap1 = NULL;
+	}
+	return ret;
+}
+
 static int riscv_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
 {
+	if (riscv_private_config(target)->ws63 && ws63_bus_address(address, (uint64_t)size * count)) {
+		int ret = ws63_bus_init(target);
+		if (ret != ERROR_OK)
+			return ret;
+		return mem_ap_read_buf(riscv_info(target)->ws63_ap1, buffer, size, count, address);
+	}
 	const struct riscv_mem_access_args args = {
 		.address = address,
 		.read_buffer = buffer,
@@ -3509,6 +3727,19 @@ static int riscv_read_memory(struct target *target, target_addr_t address,
 static int riscv_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
+	bool ws63 = riscv_private_config(target)->ws63;
+	if (ws63 && address < 0x14c000 && address + (uint64_t)size * count > 0x100000) {
+		LOG_TARGET_ERROR(target, "WS63 BootROM is read-only");
+		return ERROR_FAIL;
+	}
+	if (ws63 && address < 0x600000 && address + (uint64_t)size * count > 0x200000) {
+		LOG_TARGET_ERROR(target, "Use Flash commands to write WS63 NOR Flash");
+		return ERROR_FAIL;
+	}
+	if (ws63 && address >= 0x40000000 && ws63_bus_address(address, (uint64_t)size * count)) {
+		int ret = ws63_bus_init(target);
+		return ret == ERROR_OK ? mem_ap_write_buf(riscv_info(target)->ws63_ap1, buffer, size, count, address) : ret;
+	}
 	const struct riscv_mem_access_args args = {
 		.address = address,
 		.write_buffer = buffer,
@@ -3517,7 +3748,10 @@ static int riscv_write_memory(struct target *target, target_addr_t address,
 		.increment = size,
 	};
 
-	return riscv_rw_memory(target, args);
+	int ret = riscv_rw_memory(target, args);
+	if (ret == ERROR_OK && ws63)
+		ret = riscv_ws63_sync(target);
+	return ret;
 }
 
 static const char *riscv_get_gdb_arch(const struct target *target)
@@ -3926,6 +4160,19 @@ static int riscv_poll_hart(struct target *target, enum riscv_next_action *next_a
 			enum riscv_halt_reason halt_reason = riscv_halt_reason(target);
 			if (set_debug_reason(target, halt_reason) != ERROR_OK)
 				return ERROR_FAIL;
+
+			if (riscv_private_config(target)->ws63 && target->debug_reason == DBG_REASON_WATCHPOINT) {
+				struct watchpoint *wp;
+				bool guard;
+				if (ws63_watch_hit(target, &wp, &guard) != ERROR_OK)
+					return ERROR_FAIL;
+				if (!wp && guard) {
+					if (old_or_new_riscv_step_impl(target, true, 0, true, false) != ERROR_OK)
+						return ERROR_FAIL;
+					*next_action = RPH_RESUME;
+					return ERROR_OK;
+				}
+			}
 
 			if (halt_reason == RISCV_HALT_EBREAK) {
 				int retval;
@@ -5636,7 +5883,30 @@ COMMAND_HANDLER(handle_riscv_virt2phys_mode)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(riscv_ws63_flash_breakpoints)
+{
+	struct target *target = get_current_target(CMD_CTX);
+	if (!riscv_private_config(target)->ws63 || CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	COMMAND_PARSE_ON_OFF(CMD_ARGV[0], riscv_info(target)->ws63_flash_breakpoints);
+	return ERROR_OK;
+}
+
 static const struct command_registration riscv_exec_command_handlers[] = {
+	{
+		.name = "ws63_flash_breakpoints",
+		.handler = riscv_ws63_flash_breakpoints,
+		.mode = COMMAND_ANY,
+		.usage = "on|off",
+		.help = "Allow WS63 software breakpoints to erase and rewrite Flash sectors.",
+	},
+	{
+		.name = "ws63_rtos_symbols",
+		.handler = liteos_ws63_symbols,
+		.mode = COMMAND_ANY,
+		.usage = "array count current scheduled interrupt",
+		.help = "Load ELF-derived LiteOS symbol addresses before GDB attaches.",
+	},
 	{
 		.name = "dump_sample_buf",
 		.handler = handle_dump_sample_buf_command,
@@ -5974,8 +6244,23 @@ static int riscv_insn_set(struct command_invocation *cmd,
 	return ERROR_OK;
 }
 
+static char *riscv_memory_map(struct target *target)
+{
+	if (!riscv_private_config(target)->ws63)
+		return NULL;
+	return alloc_printf("<memory-map>"
+		"<memory type=\"ram\" start=\"0\" length=\"0x100000\"/>"
+		"<memory type=\"rom\" start=\"0x100000\" length=\"0x4c000\"/>"
+		"<memory type=\"ram\" start=\"0x14c000\" length=\"0xb4000\"/>"
+		"<memory type=\"%s\" start=\"0x200000\" length=\"0x400000\">%s</memory>"
+		"<memory type=\"ram\" start=\"0x600000\" length=\"0xffa00000\"/>"
+		"</memory-map>", riscv_info(target)->ws63_flash_enabled ? "flash" : "rom",
+		riscv_info(target)->ws63_flash_enabled ? "<property name=\"blocksize\">0x1000</property>" : "");
+}
+
 struct target_type riscv_target = {
 	.name = "riscv",
+	.get_gdb_memory_map = riscv_memory_map,
 
 	.target_create = riscv_create_target,
 	.target_jim_configure = riscv_jim_configure,

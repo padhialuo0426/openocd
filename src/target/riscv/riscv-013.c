@@ -112,6 +112,8 @@ typedef enum {
 typedef struct {
 	struct list_head list;
 	unsigned int abs_chain_position;
+	struct adiv5_dap *dap;
+	uint64_t ap_num;
 	/* The base address to access this DM on DMI */
 	uint32_t base;
 	/* The number of harts connected to this DM. */
@@ -275,12 +277,14 @@ static dm013_info_t *get_dm(struct target *target)
 		return info->dm;
 
 	unsigned int abs_chain_position = target->tap->abs_chain_position;
+	struct adiv5_private_config *pc = &riscv_private_config(target)->dap_config;
 
 	dm013_info_t *entry;
 	dm013_info_t *dm = NULL;
 	list_for_each_entry(entry, &dm_list, list) {
 		if (entry->abs_chain_position == abs_chain_position
-				&& entry->base == target->dbgbase) {
+				&& entry->base == target->dbgbase
+				&& entry->dap == pc->dap && entry->ap_num == pc->ap_num) {
 			dm = entry;
 			break;
 		}
@@ -292,6 +296,8 @@ static dm013_info_t *get_dm(struct target *target)
 		if (!dm)
 			return NULL;
 		dm->abs_chain_position = abs_chain_position;
+		dm->dap = pc->dap;
+		dm->ap_num = pc->ap_num;
 
 		/* Safety check for dbgbase */
 		assert(target->dbgbase_set || target->dbgbase == 0);
@@ -438,7 +444,7 @@ static int increase_dmi_busy_delay(struct target *target)
 {
 	RISCV013_INFO(info);
 
-	int res = dtmcs_scan(target->tap, DTM_DTMCS_DMIRESET,
+	int res = riscv_dtmcs_scan(target, DTM_DTMCS_DMIRESET,
 			NULL /* discard result */);
 	if (res != ERROR_OK)
 		return res;
@@ -2032,7 +2038,7 @@ static int examine(struct target *target)
 	LOG_TARGET_DEBUG(target, "dbgbase=0x%x", target->dbgbase);
 
 	uint32_t dtmcontrol;
-	if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
+	if (riscv_dtmcs_scan(target, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
 		LOG_TARGET_ERROR(target, "Could not scan dtmcontrol. Check JTAG connectivity/board power.");
 		return ERROR_FAIL;
 	}
@@ -2196,6 +2202,12 @@ static int examine(struct target *target)
 
 	if (set_dcsr_config(target, false) != ERROR_OK)
 		return ERROR_FAIL;
+
+	if (riscv_private_config(target)->ws63) {
+		r->ws63_rearm = true;
+		if (riscv_ws63_rearm(target) != ERROR_OK)
+			return ERROR_FAIL;
+	}
 
 	if (state_at_examine_start == RISCV_STATE_RUNNING) {
 		riscv013_step_or_resume_current_hart(target, false);
@@ -2575,7 +2587,8 @@ static int batch_run(struct target *target, struct riscv_batch *batch)
 {
 	RISCV_INFO(r);
 	RISCV013_INFO(info);
-	select_dmi(target->tap);
+	if (!riscv_info(target)->dmi_ap)
+		select_dmi(target->tap);
 	riscv_batch_add_nop(batch);
 	const int result = riscv_batch_run_from(batch, 0, &info->learned_delays,
 			/*resets_delays*/  r->reset_delays_wait >= 0,
@@ -2598,7 +2611,8 @@ static int batch_run(struct target *target, struct riscv_batch *batch)
 static int batch_run_timeout(struct target *target, struct riscv_batch *batch)
 {
 	RISCV013_INFO(info);
-	select_dmi(target->tap);
+	if (!riscv_info(target)->dmi_ap)
+		select_dmi(target->tap);
 	riscv_batch_add_nop(batch);
 
 	size_t finished_scans = 0;
@@ -2846,6 +2860,8 @@ static int riscv013_get_hart_state(struct target *target, enum riscv_hart_state 
 		return ERROR_FAIL;
 	if (get_field(dmstatus, DM_DMSTATUS_ANYHAVERESET)) {
 		LOG_TARGET_INFO(target, "Hart unexpectedly reset!");
+		if (riscv_private_config(target)->ws63)
+			riscv_info(target)->ws63_rearm = true;
 		info->dcsr_register_is_set = false;
 		/* TODO: Can we make this more obvious to eg. a gdb user? */
 		uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE |
@@ -2904,6 +2920,21 @@ static int handle_became_unavailable(struct target *target,
 static int tick(struct target *target)
 {
 	RISCV013_INFO(info);
+	if (riscv_private_config(target)->ws63 && riscv_info(target)->ws63_rearm &&
+			target_was_examined(target)) {
+		bool running = target->state == TARGET_RUNNING;
+		if (running && riscv013_halt_go(target) != ERROR_OK)
+			return ERROR_FAIL;
+		target->state = TARGET_HALTED;
+		riscv_reg_cache_invalidate_all(target);
+		if (riscv_ws63_rearm(target) != ERROR_OK)
+			return ERROR_FAIL;
+		if (running) {
+			if (riscv013_step_or_resume_current_hart(target, false) != ERROR_OK)
+				return ERROR_FAIL;
+			target->state = TARGET_RUNNING;
+		}
+	}
 	if (!info->dcsr_register_is_set &&
 			target->state == TARGET_RUNNING &&
 			target_was_examined(target))
@@ -2969,7 +3000,8 @@ static int assert_reset(struct target *target)
 	RISCV013_INFO(info);
 	int result;
 
-	select_dmi(target->tap);
+	if (!riscv_info(target)->dmi_ap)
+		select_dmi(target->tap);
 
 	if (target_has_event_action(target, TARGET_EVENT_RESET_ASSERT)) {
 		/* Run the user-supplied script if there is one. */
@@ -3023,7 +3055,8 @@ static int deassert_reset(struct target *target)
 		return ERROR_FAIL;
 	int result;
 
-	select_dmi(target->tap);
+	if (!riscv_info(target)->dmi_ap)
+		select_dmi(target->tap);
 	/* Clear the reset, but make sure haltreq is still set */
 	uint32_t control = 0;
 	control = set_field(control, DM_DMCONTROL_DMACTIVE, 1);
@@ -4510,7 +4543,8 @@ read_memory_progbuf(struct target *target, const struct riscv_mem_access_args ar
 {
 	assert(riscv_mem_access_is_read(args));
 
-	select_dmi(target->tap);
+	if (!riscv_info(target)->dmi_ap)
+		select_dmi(target->tap);
 	memset(args.read_buffer, 0, args.count * args.size);
 
 	if (execute_autofence(target) != ERROR_OK)
@@ -5530,6 +5564,12 @@ static unsigned int riscv013_get_dmi_address_bits(const struct target *target)
 /* Helper Functions. */
 static int riscv013_on_step_or_resume(struct target *target, bool step)
 {
+	if (riscv_private_config(target)->ws63 &&
+			(riscv_info(target)->ws63_flash_failed || riscv_info(target)->ws63_flash_changed)) {
+		LOG_TARGET_ERROR(target, "Recover failed Flash writes and reset after programming before running");
+		return ERROR_FAIL;
+	}
+
 	if (has_sufficient_progbuf(target, 2))
 		if (execute_autofence(target) != ERROR_OK)
 			return ERROR_FAIL;

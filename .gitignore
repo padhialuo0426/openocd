@@ -45,6 +45,7 @@ doc/openocd.html
 doc/openocd.info
 doc/openocd.info-1
 doc/openocd.info-2
+doc/openocd.info-3
 doc/openocd.ky
 doc/openocd.log
 doc/openocd.pdf
@@ -114,3 +115,9 @@ GTAGS
 # A compile_commands.json can be generated using bear and will help tools such
 # as clangd to locate header files and use correct $CFLAGS
 compile_commands.json
+
+# Local WS63 debug images, backups and hardware test records
+/artifacts/
+/ws63-flash-backups/
+/build/
+/contrib/ws63/__pycache__/
