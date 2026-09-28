@@ -294,6 +294,9 @@ static int ws63_erase(struct flash_bank *bank, unsigned int first, unsigned int 
 {
 	if (last >= bank->num_sectors || first > last)
 		return ERROR_FLASH_SECTOR_INVALID;
+	if (riscv_ws63_check_write(bank->target, bank->base + first * WS63_SECTOR,
+			(last - first + 1) * WS63_SECTOR) != ERROR_OK)
+		return ERROR_FAIL;
 	int ret = ws63_backup(bank, first * WS63_SECTOR, (last - first + 1) * WS63_SECTOR);
 	if (ret != ERROR_OK)
 		return ret;
@@ -329,6 +332,8 @@ static int ws63_write(struct flash_bank *bank, const uint8_t *buffer,
 		return ERROR_FLASH_DST_OUT_OF_BANK;
 	if (!count)
 		return ERROR_OK;
+	if (riscv_ws63_check_write(bank->target, bank->base + offset, count) != ERROR_OK)
+		return ERROR_FAIL;
 	int ret = ws63_backup(bank, offset, count);
 	if (ret != ERROR_OK)
 		return ret;

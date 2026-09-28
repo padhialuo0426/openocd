@@ -3001,6 +3001,9 @@ static int assert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
 	int result;
+	/* WS63 loses its triggers on reset. Stop at reset even for 'reset run'
+	 * so they can be restored before the first instruction executes. */
+	bool halt = target->reset_halt || riscv_private_config(target)->ws63;
 
 	if (!riscv_info(target)->dmi_ap)
 		select_dmi(target->tap);
@@ -3016,13 +3019,13 @@ static int assert_reset(struct target *target)
 		uint32_t control = set_field(0, DM_DMCONTROL_DMACTIVE, 1);
 		control = set_dmcontrol_hartsel(control, info->index);
 		control = set_field(control, DM_DMCONTROL_HALTREQ,
-				target->reset_halt ? 1 : 0);
+				halt ? 1 : 0);
 		control = set_field(control, DM_DMCONTROL_NDMRESET, 1);
 		/* If `abstractcs.busy` is set, debugger should not
 		 * change `hartsel` or set `haltreq`
 		 */
 		const bool hartsel_changed = (int)info->index != dm->current_hartid;
-		if (hartsel_changed || target->reset_halt) {
+		if (hartsel_changed || halt) {
 			result = wait_for_idle_if_needed(target);
 			if (result != ERROR_OK)
 				return result;
@@ -3052,6 +3055,8 @@ static bool dcsr_config_equals_reset_value(const struct target *target)
 static int deassert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
+	bool ws63 = riscv_private_config(target)->ws63;
+	bool halt = target->reset_halt || ws63;
 	dm013_info_t *dm = get_dm(target);
 	if (!dm)
 		return ERROR_FAIL;
@@ -3062,7 +3067,7 @@ static int deassert_reset(struct target *target)
 	/* Clear the reset, but make sure haltreq is still set */
 	uint32_t control = 0;
 	control = set_field(control, DM_DMCONTROL_DMACTIVE, 1);
-	control = set_field(control, DM_DMCONTROL_HALTREQ, target->reset_halt ? 1 : 0);
+	control = set_field(control, DM_DMCONTROL_HALTREQ, halt ? 1 : 0);
 	control = set_dmcontrol_hartsel(control, info->index);
 	/* If `abstractcs.busy` is set, debugger should not
 	 * change `hartsel`.
@@ -3110,7 +3115,7 @@ static int deassert_reset(struct target *target)
 	if (result != ERROR_OK)
 		return result;
 
-	if (target->reset_halt) {
+	if (halt) {
 		target->state = TARGET_HALTED;
 		target->debug_reason = DBG_REASON_DBGRQ;
 	} else {
@@ -3118,6 +3123,24 @@ static int deassert_reset(struct target *target)
 		target->debug_reason = DBG_REASON_NOTHALTED;
 	}
 	info->dcsr_register_is_set = dcsr_config_equals_reset_value(target);
+	if (ws63) {
+		/* This path acknowledges havereset itself, so the unexpected-reset
+		 * poll hook cannot be relied upon to rearm explicit resets. */
+		riscv_reg_cache_invalidate_all(target);
+		riscv_info(target)->ws63_rearm = true;
+		result = riscv_ws63_rearm(target);
+		if (result != ERROR_OK)
+			return result;
+		if (!target->reset_halt) {
+			if (set_dcsr_config(target, false) != ERROR_OK)
+				return ERROR_FAIL;
+			result = riscv013_step_or_resume_current_hart(target, false);
+			if (result != ERROR_OK)
+				return result;
+			target->state = TARGET_RUNNING;
+			target->debug_reason = DBG_REASON_NOTHALTED;
+		}
+	}
 	return ERROR_OK;
 }
 
@@ -5777,6 +5800,8 @@ static int riscv013_on_step_or_resume(struct target *target, bool step)
 		LOG_TARGET_ERROR(target, "Recover failed Flash writes and reset after programming before running");
 		return ERROR_FAIL;
 	}
+	if (riscv_private_config(target)->ws63 && riscv_ws63_rearm(target) != ERROR_OK)
+		return ERROR_FAIL;
 
 	if (has_sufficient_progbuf(target, 2))
 		if (execute_autofence(target) != ERROR_OK)

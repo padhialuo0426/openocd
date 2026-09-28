@@ -81,18 +81,71 @@ thread apply all bt 5
 线程配置必须在 GDB 首次连接前加载，以便初始化线程标识。调试源码时，另按本机 SDK 路径配置
 GDB 的 `set substitute-path`。回溯因 ROM 缺少展开信息而停止时，保留已知帧，不将后续猜测视为有效调用链。
 
-## 4. 检查修改
+## 4. 复位并停在应用入口
 
-关闭 GDB、移除全部断点和观察点，让 OpenOCD 保持连接。以下检查暂借任务栈下方的 64 字节 RAM，
-保存并恢复 CPU 与 RAM，验证寄存器、缓存、AP1 边界访问及 RAM 软件断点；不会写 Flash。
-输出目录必须尚不存在；失败时 CPU 保持暂停，恢复现场保存在该目录。
+以下命令用于已经连接的目标和匹配的应用 ELF。复位会重新执行启动流程；
+先按第 5 节保存固件，随后在 GDB 中删除已有断点和观察点，再设置应用入口硬件断点：
 
-```sh
-python3 contrib/ws63/check_core.py --output artifacts/core-check
+```gdb
+monitor halt
+delete breakpoints
+monitor gdb breakpoint_override hard
+monitor reset halt
+maintenance flush register-cache
+hbreak main
+continue
+info registers pc sp
+bt 3
+delete breakpoints
+monitor gdb breakpoint_override disable
 ```
 
-成功时输出各项 `PASS` 和恢复后的运行状态。
-`contrib/ws63/check_decoder.py --objdump` 接受 SDK objdump 路径，可离线核对全部短指令访存解码。
-`contrib/ws63/gdb_smoke.gdb` 和 `contrib/ws63/gdb_flash_breakpoints.gdb` 用于匹配 SDK blinky 的 GDB 回归；
-后者要求启用 Flash 软件断点，会改写应用扇区。执行前按功能参考保存涉及的整个扇区。
-日志、备份、转储及生成 ELF 都放在被忽略的 `artifacts/`，不提交到分支。
+`reset halt` 后 CPU 应暂停在 `0x100000`；继续后应停在 ELF 的 `main`。
+`maintenance flush register-cache` 避免 GDB 使用复位前的寄存器缓存决定下一次断点或单步操作。
+结束时清除强制硬件断点设置，避免影响同一 OpenOCD 服务中的后续调试连接。
+启动过程若使 SWD 短暂断开，等待后端重新检查目标；持续无法恢复时检查 SWD 引脚配置和固件。
+
+进入有源码的应用函数后，使用 `step` 进入调用、`next` 跨过调用、`finish` 返回调用者，
+或用 `stepi` 执行一条指令。等待 LiteOS 完成初始化后，再查看任务列表和任务栈。
+调试结束时删除断点和观察点，再执行 `continue` 恢复运行。
+
+SDK 会在 ELF 链接后生成 ROM 补丁表和签名。需要更换可启动应用时，使用配套签名 BIN，
+保留 ELF 供源码调试；不能将直接 `load` 原 ELF 视为完整的固件安装流程。
+烧录边界和保护要求见[功能参考的 Flash 部分](ws63.md#32-flash)。
+
+## 5. 保存与核对固件
+
+改写 Flash 或运行会复位的验证前，删除所有断点和观察点，暂停 CPU，再保存当前板卡的完整 Flash 和 ROM。
+确认 `artifacts/` 已存在，以下输出文件尚不存在；在 Tcl 或 telnet 控制台执行：
+
+```tcl
+halt
+ws63_ap1_dump artifacts/before-flash.bin 0x200000 0x400000
+ws63_ap1_dump artifacts/before-rom.bin 0x100000 0x4c000
+```
+
+Flash 文件应为 4,194,304 字节，ROM 文件应为 311,296 字节。回到主机终端，记录校验值：
+
+```sh
+sha256sum artifacts/before-flash.bin artifacts/before-rom.bin
+```
+
+恢复固件后，先让它启动并运行，再暂停 CPU，导出另一组文件：
+
+```tcl
+halt
+ws63_ap1_dump artifacts/after-flash.bin 0x200000 0x400000
+ws63_ap1_dump artifacts/after-rom.bin 0x100000 0x4c000
+```
+
+在主机终端逐字节比较：
+
+```sh
+cmp artifacts/before-flash.bin artifacts/after-flash.bin
+cmp artifacts/before-rom.bin artifacts/after-rom.bin
+```
+
+两条命令均无输出且退出码为 0 时，文件一致。若有差异，保持目标暂停，核对并恢复所有受影响扇区，
+包括固件启动时可能改写的配置区和升级区；仅恢复应用区不能证明完整固件已恢复。
+另行核对 Flash 保护状态，确认没有遗留断点和观察点，再恢复运行。
+日志、测试脚本、备份、转储及生成 ELF 保留在被忽略的 `artifacts/`，不加入提交。

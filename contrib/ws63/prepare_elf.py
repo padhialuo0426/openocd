@@ -210,6 +210,16 @@ def reglist(text):
     return regs
 
 
+def stack_store(saved, original, offset, size, register=None):
+    """Invalidate every saved word touched by a known CFA-relative store."""
+    for reg, location in list(saved.items()):
+        if offset < location + 4 and location < offset + size:
+            del saved[reg]
+    if size == 4 and register in original:
+        # Prefer the newest copy. Keeping an older copy can retain a reused slot.
+        saved[register] = offset
+
+
 def unwind_states(start, size, instructions):
     """Dataflow for fixed stack frames, integer stores and WS63 push/stmia.
 
@@ -277,8 +287,7 @@ def unwind_states(start, size, instructions):
                 amount = int(match[2])
                 if op == "push":
                     for i, r in enumerate(regs):
-                        if r in original:
-                            saved[r] = delta - 4 * (i + 1)
+                        stack_store(saved, original, delta - 4 * (i + 1), 4, r)
                 else:
                     for i, r in enumerate(regs):
                         if saved.get(r) == delta + amount - 4 * (i + 1):
@@ -289,15 +298,17 @@ def unwind_states(start, size, instructions):
                         expr.pop(r, None)
                 delta += amount
                 expr[2] = delta
-            elif op in ("sw", "fsw"):
+            elif op in ("sb", "sh", "sw", "sd", "fsw", "fsd"):
                 match = re.fullmatch(
                     r"([^,]+),(-?\d+)\(([^)]+)\)", args.replace(" ", "")
                 )
-                if match and op == "sw":
-                    r = REGNUM.get(match[1])
-                    base = REGNUM.get(match[3])
-                    if r in original and base in expr:
-                        saved.setdefault(r, expr[base] + int(match[2]))
+                if not match:
+                    return {}
+                base = REGNUM.get(match[3])
+                if base in expr:
+                    width = {"sb": 1, "sh": 2, "sw": 4, "sd": 8, "fsw": 4, "fsd": 8}[op]
+                    r = REGNUM.get(match[1]) if op == "sw" else None
+                    stack_store(saved, original, expr[base] + int(match[2]), width, r)
             elif op in ("stmia", "ldmia"):
                 match = re.fullmatch(r"\{([^}]+)\},\s*\(([^)]+)\)", args)
                 if match:
@@ -307,10 +318,9 @@ def unwind_states(start, size, instructions):
                         return {}
                     if op == "stmia":
                         for i, r in enumerate(regs):
-                            if r in original:
-                                saved.setdefault(
-                                    r, expr[base] + 4 * (len(regs) - i - 1)
-                                )
+                            stack_store(
+                                saved, original, expr[base] + 4 * (len(regs) - i - 1), 4, r
+                            )
                     else:
                         base_offset = expr[base]
                         for i, r in enumerate(regs):
