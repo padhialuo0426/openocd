@@ -1652,12 +1652,38 @@ int riscv_ws63_sync(struct target *target)
 	return ret;
 }
 
+int riscv_ws63_check_write(struct target *target, target_addr_t address, uint64_t length)
+{
+	if (!riscv_private_config(target)->ws63 || riscv_info(target)->ws63_patching_breakpoint || !length)
+		return ERROR_OK;
+	for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
+		if (bp->type != BKPT_SOFT || !bp->is_set)
+			continue;
+		/* Subtraction avoids wrapping at the end of the target address space. */
+		bool overlap = address <= bp->address ? bp->address - address < length :
+			address - bp->address < bp->length;
+		if (overlap) {
+			LOG_TARGET_ERROR(target, "Remove software breakpoint at " TARGET_ADDR_FMT
+				" before writing or erasing this range", bp->address);
+			return ERROR_FAIL;
+		}
+	}
+	return ERROR_OK;
+}
+
 static int riscv_breakpoint_write(struct target *target, target_addr_t address,
 		uint32_t size, uint8_t *data)
 {
+	RISCV_INFO(r);
+	bool patching = r->ws63_patching_breakpoint;
+	r->ws63_patching_breakpoint = true;
+	int ret;
 	if (riscv_private_config(target)->ws63 && address >= 0x200000 && address < 0x600000)
-		return ws63_flash_patch(target, address, data, size);
-	return riscv_write_by_any_size(target, address, size, data);
+		ret = ws63_flash_patch(target, address, data, size);
+	else
+		ret = riscv_write_by_any_size(target, address, size, data);
+	r->ws63_patching_breakpoint = patching;
+	return ret;
 }
 
 static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakpoint)
@@ -1753,7 +1779,25 @@ static int remove_trigger(struct target *target, int unique_id)
 static int riscv_remove_breakpoint(struct target *target,
 		struct breakpoint *breakpoint)
 {
+	if (riscv_private_config(target)->ws63 && !breakpoint->is_set)
+		return ERROR_OK;
 	if (breakpoint->type == BKPT_SOFT) {
+		if (riscv_private_config(target)->ws63) {
+			uint8_t actual[4], expected[4] = {0};
+			if (breakpoint->length != 2 && breakpoint->length != 4)
+				return ERROR_FAIL;
+			int ret = riscv_read_by_any_size(target, breakpoint->address, breakpoint->length, actual);
+			if (ret != ERROR_OK)
+				return ret;
+			buf_set_u32(expected, 0, breakpoint->length * CHAR_BIT,
+				breakpoint->length == 4 ? ebreak() : ebreak_c());
+			if (memcmp(actual, expected, breakpoint->length)) {
+				LOG_TARGET_WARNING(target, "Software breakpoint at " TARGET_ADDR_FMT
+					" was overwritten; preserving current instruction", breakpoint->address);
+				breakpoint->is_set = false;
+				return ERROR_OK;
+			}
+		}
 		/* Write the original instruction. */
 		if (riscv_breakpoint_write(target, breakpoint->address,
 				breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
@@ -2966,8 +3010,30 @@ static int riscv_assert_reset(struct target *target)
 			return ERROR_FAIL;
 		}
 		for (struct breakpoint *bp = target->breakpoints; bp; bp = bp->next) {
-			if (bp->type == BKPT_SOFT && bp->is_set && riscv_remove_breakpoint(target, bp) != ERROR_OK)
+			if (bp->type != BKPT_SOFT)
+				continue;
+			if (target->state != TARGET_HALTED &&
+					(riscv_halt(target) != ERROR_OK || target->state != TARGET_HALTED))
 				return ERROR_FAIL;
+			/* Hardware breakpoints survive boot verification and RAM reinitialization.
+			 * Reserve the trigger before changing the installed software breakpoint. */
+			struct breakpoint hardware = *bp;
+			hardware.type = BKPT_HARD;
+			hardware.is_set = false;
+			if (riscv_add_breakpoint(target, &hardware) != ERROR_OK) {
+				LOG_TARGET_ERROR(target, "Reset needs a hardware slot for software breakpoint at "
+					TARGET_ADDR_FMT "; remove breakpoints/watchpoints and retry", bp->address);
+				return ERROR_FAIL;
+			}
+			if (riscv_remove_breakpoint(target, bp) != ERROR_OK) {
+				if (riscv_remove_breakpoint(target, &hardware) != ERROR_OK)
+					LOG_TARGET_ERROR(target, "Failed to release reset breakpoint trigger");
+				return ERROR_FAIL;
+			}
+			bp->type = BKPT_HARD;
+			breakpoint_hw_set(bp, hardware.number);
+			LOG_TARGET_INFO(target, "Converted software breakpoint at " TARGET_ADDR_FMT
+				" to hardware for reset", bp->address);
 		}
 	}
 
@@ -3728,6 +3794,8 @@ static int riscv_write_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, const uint8_t *buffer)
 {
 	bool ws63 = riscv_private_config(target)->ws63;
+	if (riscv_ws63_check_write(target, address, (uint64_t)size * count) != ERROR_OK)
+		return ERROR_FAIL;
 	if (ws63 && address < 0x14c000 && address + (uint64_t)size * count > 0x100000) {
 		LOG_TARGET_ERROR(target, "WS63 BootROM is read-only");
 		return ERROR_FAIL;

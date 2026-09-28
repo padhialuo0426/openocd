@@ -176,6 +176,7 @@ struct riscv_info {
 	bool ws63_flash_changed;
 	bool ws63_flash_enabled;
 	bool ws63_flash_breakpoints;
+	bool ws63_patching_breakpoint;
 
 	unsigned int dtm_version;
 
@@ -448,6 +449,7 @@ extern struct scan_field select_idcode;
 
 int riscv_ws63_sync(struct target *target);
 int riscv_ws63_rearm(struct target *target);
+int riscv_ws63_check_write(struct target *target, target_addr_t address, uint64_t length);
 int ws63_flash_patch(struct target *target, target_addr_t address, const uint8_t *data, uint32_t count);
 int riscv_dtmcs_scan(struct target *target, uint32_t out, uint32_t *in_ptr);
 int dtmcs_scan(struct jtag_tap *tap, uint32_t out, uint32_t *in_ptr);
